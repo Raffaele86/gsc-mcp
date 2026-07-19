@@ -6,6 +6,7 @@ GSC MCP Server — Google Search Console via Model Context Protocol
 Uses MCP SDK built-in OAuth 2.1 framework for Cowork/Claude.ai compatibility.
 """
 
+import asyncio
 import json
 import secrets
 import sqlite3
@@ -166,7 +167,7 @@ def db_fetchone(sql: str, params: tuple = ()) -> sqlite3.Row | None:
 # 3. Google API Helpers
 # ---------------------------------------------------------------------------
 
-def get_gsc_service(user_id: str):
+def _load_credentials(user_id: str) -> Credentials:
     row = db_fetchone(
         "SELECT credentials_json FROM google_credentials WHERE user_id=?", (user_id,)
     )
@@ -188,32 +189,35 @@ def get_gsc_service(user_id: str):
             "UPDATE google_credentials SET credentials_json=?, updated_at=? WHERE user_id=?",
             (json.dumps(creds_data), datetime.utcnow().isoformat(), user_id),
         )
-    return build("searchconsole", "v1", credentials=creds, cache_discovery=False)
+    return creds
+
+
+def get_gsc_service(user_id: str):
+    return build("searchconsole", "v1", credentials=_load_credentials(user_id), cache_discovery=False)
 
 
 def get_indexing_service(user_id: str):
-    row = db_fetchone(
-        "SELECT credentials_json FROM google_credentials WHERE user_id=?", (user_id,)
-    )
-    if not row:
-        raise ValueError(f"No Google credentials for user {user_id}")
-    creds_data = json.loads(row["credentials_json"])
-    creds = Credentials(
-        token=creds_data.get("token"),
-        refresh_token=creds_data.get("refresh_token"),
-        token_uri=creds_data.get("token_uri", "https://oauth2.googleapis.com/token"),
-        client_id=creds_data.get("client_id", GOOGLE_CLIENT_ID),
-        client_secret=creds_data.get("client_secret", GOOGLE_CLIENT_SECRET),
-        scopes=creds_data.get("scopes", GOOGLE_SCOPES),
-    )
-    if creds.expired and creds.refresh_token:
-        creds.refresh(GoogleAuthRequest())
-        creds_data["token"] = creds.token
-        db_execute(
-            "UPDATE google_credentials SET credentials_json=?, updated_at=? WHERE user_id=?",
-            (json.dumps(creds_data), datetime.utcnow().isoformat(), user_id),
-        )
-    return build("indexing", "v3", credentials=creds, cache_discovery=False)
+    return build("indexing", "v3", credentials=_load_credentials(user_id), cache_discovery=False)
+
+
+async def _run_batch(items: list, worker, user_id: str, concurrency: int) -> list:
+    """Esegue worker(item, http) in thread paralleli con cap di concorrenza.
+
+    httplib2 non è thread-safe: ogni task usa un AuthorizedHttp dedicato
+    (stesse credenziali, passato a request.execute(http=...)). Risultati in
+    ordine di input."""
+    import httplib2
+    import google_auth_httplib2
+
+    creds = _load_credentials(user_id)
+    sem = asyncio.Semaphore(concurrency)
+
+    async def one(item):
+        async with sem:
+            http = google_auth_httplib2.AuthorizedHttp(creds, http=httplib2.Http())
+            return await asyncio.to_thread(worker, item, http)
+
+    return list(await asyncio.gather(*(one(i) for i in items)))
 
 
 def _get_user_id() -> str:
@@ -1053,14 +1057,14 @@ async def bulk_inspect_urls(site_url: str, urls: list[str]) -> str:
     """Ispeziona più URL in batch tramite la URL Inspection API. Max 50 URL per chiamata."""
     uid = _get_user_id()
     service = get_gsc_service(uid)
-    results = []
-    for url in urls[:50]:
+
+    def inspect(url, http):
         try:
             body = {"inspectionUrl": url, "siteUrl": site_url}
-            result = service.urlInspection().index().inspect(body=body).execute()
+            result = service.urlInspection().index().inspect(body=body).execute(http=http)
             inspection = result.get("inspectionResult", {})
             index_status = inspection.get("indexStatusResult", {})
-            results.append({
+            return {
                 "url": url,
                 "verdict": index_status.get("verdict", "UNKNOWN"),
                 "coverageState": index_status.get("coverageState", ""),
@@ -1069,9 +1073,11 @@ async def bulk_inspect_urls(site_url: str, urls: list[str]) -> str:
                 "lastCrawlTime": index_status.get("lastCrawlTime", ""),
                 "pageFetchState": index_status.get("pageFetchState", ""),
                 "crawledAs": index_status.get("crawledAs", ""),
-            })
+            }
         except Exception as e:
-            results.append({"url": url, "error": str(e)})
+            return {"url": url, "error": str(e)}
+
+    results = await _run_batch(urls[:50], inspect, uid, concurrency=4)
     return json.dumps({"inspected": len(results), "results": results}, indent=2, default=str)
 
 
@@ -1081,14 +1087,17 @@ async def bulk_request_indexing(urls: list[str]) -> str:
     ATTENZIONE: Google ha un limite giornaliero di ~200 richieste."""
     uid = _get_user_id()
     service = get_indexing_service(uid)
-    results = []
-    for url in urls[:50]:
+
+    def publish(url, http):
         try:
             body = {"url": url, "type": "URL_UPDATED"}
-            result = service.urlNotifications().publish(body=body).execute()
-            results.append({"url": url, "status": "submitted", "response": result})
+            result = service.urlNotifications().publish(body=body).execute(http=http)
+            return {"url": url, "status": "submitted", "response": result}
         except Exception as e:
-            results.append({"url": url, "status": "error", "error": str(e)})
+            return {"url": url, "status": "error", "error": str(e)}
+
+    # concorrenza bassa: il vincolo vero è la quota giornaliera (~200/die)
+    results = await _run_batch(urls[:50], publish, uid, concurrency=3)
     return json.dumps({"submitted": len([r for r in results if r["status"] == "submitted"]),
                         "errors": len([r for r in results if r["status"] == "error"]),
                         "results": results}, indent=2, default=str)
@@ -1108,23 +1117,20 @@ async def indexing_status_summary(site_url: str, urls: list[str]) -> str:
     """Riepilogo stato indicizzazione di più URL: quanti indicizzati, quanti no, quanti con errori."""
     uid = _get_user_id()
     service = get_gsc_service(uid)
-    indexed = 0
-    not_indexed = 0
-    errors = 0
-    details = []
-    for url in urls[:50]:
+
+    def inspect(url, http):
         try:
             body = {"inspectionUrl": url, "siteUrl": site_url}
-            result = service.urlInspection().index().inspect(body=body).execute()
+            result = service.urlInspection().index().inspect(body=body).execute(http=http)
             verdict = result.get("inspectionResult", {}).get("indexStatusResult", {}).get("verdict", "UNKNOWN")
-            if verdict == "PASS":
-                indexed += 1
-            else:
-                not_indexed += 1
-            details.append({"url": url, "verdict": verdict})
+            return {"url": url, "verdict": verdict}
         except Exception as e:
-            errors += 1
-            details.append({"url": url, "verdict": "ERROR", "error": str(e)})
+            return {"url": url, "verdict": "ERROR", "error": str(e)}
+
+    details = await _run_batch(urls[:50], inspect, uid, concurrency=4)
+    indexed = sum(1 for d in details if d["verdict"] == "PASS")
+    errors = sum(1 for d in details if d["verdict"] == "ERROR")
+    not_indexed = len(details) - indexed - errors
     return json.dumps({
         "total": len(urls[:50]), "indexed": indexed,
         "not_indexed": not_indexed, "errors": errors,
